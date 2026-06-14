@@ -1,0 +1,7 @@
+/.env*
+
+# Built CLI binaries
+/download-workshop
+/download_app
+/app-download
+/guard

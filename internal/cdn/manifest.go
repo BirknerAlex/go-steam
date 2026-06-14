@@ -1,0 +1,466 @@
+package cdn
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/ulikunitz/xz/lzma"
+
+	"github.com/BirknerAlex/go-steam/internal/proto"
+)
+
+// Manifest is a parsed depot manifest.
+type Manifest struct {
+	DepotID     uint32
+	ManifestGID uint64
+	CreatedAt   time.Time
+	Files       []ManifestFile
+}
+
+// ManifestFile describes one file in a depot.
+type ManifestFile struct {
+	Path   string
+	Size   int64
+	Flags  uint32
+	SHA1   []byte
+	Chunks []ChunkInfo
+	// IsSymlink is true when Flags has the SymLink bit set (0x40).
+	IsSymlink     bool
+	SymlinkTarget string
+}
+
+// ChunkInfo describes one content chunk within a file.
+type ChunkInfo struct {
+	SHA1             []byte // also the chunk ID used in CDN URLs
+	Offset           int64  // byte offset within the decompressed file
+	CompressedSize   uint32
+	UncompressedSize uint32
+}
+
+// EDepotFileFlag values from SteamKit2 EDepotFileFlag enum.
+const (
+	fileExecutable = uint32(0x20) // EDepotFileFlag.Executable = 32
+	fileDir        = uint32(0x40) // EDepotFileFlag.Directory  = 64
+)
+
+// DownloadManifest fetches and decrypts the manifest for the given depot.
+// manifestRequestCode is appended to the URL path when non-zero (modern Steam CDN auth).
+// token is an optional CDN auth token sent as a URL query parameter (legacy; usually empty).
+func DownloadManifest(
+	ctx context.Context,
+	httpClient *http.Client,
+	server *Server,
+	depotID uint32,
+	manifestGID uint64,
+	depotKey []byte,
+	token string,
+	manifestRequestCode uint64,
+) (*Manifest, error) {
+	var url string
+	if manifestRequestCode > 0 {
+		url = fmt.Sprintf("https://%s/depot/%d/manifest/%d/5/%d", server.Host, depotID, manifestGID, manifestRequestCode)
+	} else {
+		url = fmt.Sprintf("https://%s/depot/%d/manifest/%d/5", server.Host, depotID, manifestGID)
+	}
+	if token != "" {
+		url += "?" + token
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("manifest: HTTP %d for depot %d manifest %d", resp.StatusCode, depotID, manifestGID)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: read body: %w", err)
+	}
+
+	// The manifest response is a protobuf ContentManifest with three sections:
+	// payload, metadata, signature.  The payload is AES-CBC encrypted with the
+	// depot key and then LZMA-compressed.
+	//
+	// Wire format (each section):
+	//   uint32 LE: size of (proto-encoded) message
+	//   [size bytes]: proto-encoded section
+	//
+	// We parse each section and combine into the final Manifest.
+	return decodeManifest(raw, depotKey, depotID, manifestGID)
+}
+
+func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest, error) {
+	slog.Debug("decodeManifest", "depot", depotID, "gid", gid, "raw_len", len(raw), "has_key", len(depotKey) == 32)
+
+	var payload proto.ContentManifestPayload
+	var metadata proto.ContentManifestMetadata
+
+	// Steam3 binary manifest ("version 4") — magic 0x16349781. This is a flat
+	// binary structure rather than the protobuf section format.
+	if len(raw) >= 4 && binary.LittleEndian.Uint32(raw[:4]) == steam3ManifestMagic {
+		slog.Debug("decodeManifest: steam3 v4 format detected")
+		p, m, err := parseSteam3Manifest(raw)
+		if err != nil {
+			return nil, fmt.Errorf("manifest: %w", err)
+		}
+		payload, metadata = p, m
+	} else if len(raw) >= 4 && binary.LittleEndian.Uint32(raw[:4]) == 0x04034B50 {
+		// ZIP magic 0x04034B50 — newer Steam CDN manifest format.
+		slog.Debug("decodeManifest: ZIP format detected")
+		zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+		if err != nil {
+			return nil, fmt.Errorf("manifest: open zip: %w", err)
+		}
+		if len(zr.File) == 0 {
+			return nil, fmt.Errorf("manifest: empty zip archive for depot %d", depotID)
+		}
+		rc, err := zr.File[0].Open()
+		if err != nil {
+			return nil, fmt.Errorf("manifest: open zip entry: %w", err)
+		}
+		entryBytes, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return nil, fmt.Errorf("manifest: read zip entry: %w", err)
+		}
+		slog.Debug("decodeManifest: zip entry", "name", zr.File[0].Name, "size", len(entryBytes))
+
+		// The zip entry uses the magic-prefixed section format (Steam "old binary" format):
+		//   uint32 magic  (PROTOBUF_PAYLOAD_MAGIC=0x71F617D0, METADATA=0x1F4812BE, ...)
+		//   uint32 size
+		//   [size bytes]  (proto bytes, possibly AES-CBC+LZMA encrypted)
+		// repeated until PROTOBUF_ENDOFMANIFEST_MAGIC (0x32C415AB).
+		entryPos := 0
+		for entryPos+8 <= len(entryBytes) {
+			sectionMagic := binary.LittleEndian.Uint32(entryBytes[entryPos:])
+			sectionSize := binary.LittleEndian.Uint32(entryBytes[entryPos+4:])
+			entryPos += 8
+
+			if sectionMagic == 0x32C415AB { // PROTOBUF_ENDOFMANIFEST_MAGIC
+				break
+			}
+			if entryPos+int(sectionSize) > len(entryBytes) {
+				slog.Debug("decodeManifest: section overflows entry", "magic", fmt.Sprintf("%08x", sectionMagic), "size", sectionSize)
+				break
+			}
+			section := entryBytes[entryPos : entryPos+int(sectionSize)]
+			entryPos += int(sectionSize)
+			slog.Debug("decodeManifest: entry section", "magic", fmt.Sprintf("%08x", sectionMagic), "size", sectionSize)
+
+			// Sections may be AES-CBC encrypted then LZMA compressed.
+			if len(depotKey) == 32 {
+				if dec, err := decryptManifestSection(section, depotKey); err == nil {
+					section = dec
+				}
+			}
+			if dec, err := lzmaDecompress(section); err == nil {
+				section = dec
+			}
+
+			switch sectionMagic {
+			case 0x71F617D0: // PROTOBUF_PAYLOAD_MAGIC
+				if err := payload.Unmarshal(section); err != nil {
+					slog.Debug("decodeManifest: payload unmarshal failed", "err", err)
+				} else {
+					slog.Debug("decodeManifest: payload parsed", "files", len(payload.Mappings))
+				}
+			case 0x1F4812BE: // PROTOBUF_METADATA_MAGIC
+				_ = metadata.Unmarshal(section)
+			}
+		}
+	} else {
+		// Legacy size-prefixed section format.
+		pos := 0
+		sectionIdx := 0
+		for pos < len(raw)-4 {
+			size := binary.LittleEndian.Uint32(raw[pos:])
+			pos += 4
+			if int(pos)+int(size) > len(raw) {
+				slog.Debug("decodeManifest: section overflows raw", "section", sectionIdx, "size", size, "remaining", len(raw)-pos)
+				break
+			}
+			section := raw[pos : pos+int(size)]
+			pos += int(size)
+
+			if len(depotKey) == 32 {
+				if decrypted, err := decryptManifestSection(section, depotKey); err == nil {
+					section = decrypted
+				}
+			}
+			if decompressed, err := lzmaDecompress(section); err == nil {
+				section = decompressed
+			}
+			if err := payload.Unmarshal(section); err == nil && len(payload.Mappings) > 0 {
+				sectionIdx++
+				continue
+			}
+			_ = metadata.Unmarshal(section)
+			sectionIdx++
+		}
+	}
+
+	// Decrypt filenames if the manifest uses encrypted filenames.
+	if metadata.FilenamesEncrypted && len(depotKey) == 32 {
+		slog.Debug("decodeManifest: decrypting filenames", "depot", depotID)
+		for i := range payload.Mappings {
+			plain, err := decryptFilename(payload.Mappings[i].Filename, depotKey)
+			if err == nil {
+				payload.Mappings[i].Filename = plain
+			}
+			if payload.Mappings[i].LinktargetPath != "" {
+				if plain, err := decryptFilename(payload.Mappings[i].LinktargetPath, depotKey); err == nil {
+					payload.Mappings[i].LinktargetPath = plain
+				}
+			}
+		}
+		// Steam stores encrypted manifests ordered by encrypted filename; once the
+		// names are in the clear, re-sort alphabetically so the file order matches
+		// the canonical (decrypted) manifest. Mirrors SteamKit2 DecryptFilenames,
+		// which sorts by filename using OrdinalIgnoreCase.
+		sort.SliceStable(payload.Mappings, func(i, j int) bool {
+			return strings.ToLower(payload.Mappings[i].Filename) < strings.ToLower(payload.Mappings[j].Filename)
+		})
+	}
+
+	slog.Debug("decodeManifest: result", "depot", depotID, "files", len(payload.Mappings), "filenames_encrypted", metadata.FilenamesEncrypted)
+
+	// Build our Manifest from the parsed data.
+	m := &Manifest{
+		DepotID:     depotID,
+		ManifestGID: gid,
+	}
+	if metadata.CreationTime > 0 {
+		m.CreatedAt = time.Unix(int64(metadata.CreationTime), 0)
+	}
+
+	for _, f := range payload.Mappings {
+		flags := f.Flags
+		if flags&fileDir != 0 {
+			continue // skip directories
+		}
+		isSymlink := f.LinktargetPath != ""
+		mf := ManifestFile{
+			Path:          normalizePath(f.Filename),
+			Size:          int64(f.Size),
+			Flags:         flags,
+			SHA1:          f.ShaContent,
+			IsSymlink:     isSymlink,
+			SymlinkTarget: f.LinktargetPath,
+		}
+		for _, c := range f.Chunks {
+			mf.Chunks = append(mf.Chunks, ChunkInfo{
+				SHA1:             c.Sha,
+				Offset:           int64(c.Offset),
+				CompressedSize:   c.CbCompressed,
+				UncompressedSize: c.CbOriginal,
+			})
+		}
+		m.Files = append(m.Files, mf)
+	}
+	return m, nil
+}
+
+// steam3ManifestMagic identifies the Steam3 binary ("version 4") manifest format
+// (Steam3Manifest.MAGIC in SteamKit2).
+const steam3ManifestMagic = 0x16349781
+
+// parseSteam3Manifest decodes the Steam3 binary manifest ("version 4") into the
+// same payload/metadata structures the protobuf path produces, so the shared
+// filename-decryption and Manifest-building logic can be reused.
+//
+// Layout (all little-endian), mirroring SteamKit2 Steam3Manifest.Deserialize:
+//
+//	magic(4)=0x16349781, version(4)=4, depotID(4), manifestGID(8),
+//	creationTime(4), filenamesEncrypted(4), totalUncompressedSize(8),
+//	totalCompressedSize(8), chunkCount(4), fileEntryCount(4),
+//	fileMappingSize(4), encryptedCRC(4), decryptedCRC(4), flags(4)
+//	then fileMappingSize bytes of file mappings, then a trailing magic marker.
+func parseSteam3Manifest(raw []byte) (proto.ContentManifestPayload, proto.ContentManifestMetadata, error) {
+	var payload proto.ContentManifestPayload
+	var metadata proto.ContentManifestMetadata
+
+	const headerSize = 4 + 64 // magic(4) + 13 fixed header fields(64) = 68
+	le := binary.LittleEndian
+	if len(raw) < headerSize+4 { // +4 for the trailing end-of-manifest marker
+		return payload, metadata, fmt.Errorf("steam3 manifest too short (%d bytes)", len(raw))
+	}
+	if version := le.Uint32(raw[4:]); version != 4 {
+		return payload, metadata, fmt.Errorf("unsupported steam3 manifest version %d", version)
+	}
+
+	metadata.DepotID = le.Uint32(raw[8:])
+	metadata.GIDManifest = le.Uint64(raw[12:])
+	metadata.CreationTime = le.Uint32(raw[20:])
+	metadata.FilenamesEncrypted = le.Uint32(raw[24:]) != 0
+	metadata.CbDiskOriginal = le.Uint64(raw[28:])
+	metadata.CbDiskCompressed = le.Uint64(raw[36:])
+	metadata.UniqueChunks = le.Uint32(raw[44:]) // ChunkCount
+	// raw[48:] = fileEntryCount (unused; the mapping loop is size-bounded)
+	fileMappingSize := le.Uint32(raw[52:])
+	metadata.CrcEncrypted = le.Uint32(raw[56:])
+	metadata.CrcClear = le.Uint32(raw[60:])
+	// raw[64:] = flags (unused)
+
+	start := headerSize
+	end := start + int(fileMappingSize)
+	if end > len(raw) {
+		return payload, metadata, fmt.Errorf("steam3 file mapping size %d overflows buffer (%d bytes)", fileMappingSize, len(raw))
+	}
+	for pos := start; pos < end; {
+		f, n, err := parseSteam3FileMapping(raw[pos:end])
+		if err != nil {
+			return payload, metadata, err
+		}
+		payload.Mappings = append(payload.Mappings, f)
+		pos += n
+	}
+	return payload, metadata, nil
+}
+
+// parseSteam3FileMapping decodes one file entry from a Steam3 binary manifest and
+// returns the number of bytes consumed.
+//
+//	filename(null-terminated UTF-8), totalSize(8), flags(4),
+//	hashContent(20), hashFileName(20), numChunks(4),
+//	then numChunks * { chunkGID(20), checksum(4), offset(8),
+//	                   decompressedSize(4), compressedSize(4) }
+func parseSteam3FileMapping(b []byte) (proto.ContentManifestFile, int, error) {
+	var f proto.ContentManifestFile
+	le := binary.LittleEndian
+
+	z := bytes.IndexByte(b, 0)
+	if z < 0 {
+		return f, 0, fmt.Errorf("steam3 file name not null-terminated")
+	}
+	f.Filename = string(b[:z])
+	pos := z + 1
+
+	const fixed = 8 + 4 + 20 + 20 + 4 // totalSize..numChunks
+	if pos+fixed > len(b) {
+		return f, 0, fmt.Errorf("steam3 file mapping truncated")
+	}
+	f.Size = le.Uint64(b[pos:])
+	pos += 8
+	f.Flags = le.Uint32(b[pos:])
+	pos += 4
+	f.ShaContent = append([]byte(nil), b[pos:pos+20]...)
+	pos += 20
+	f.ShaFilename = append([]byte(nil), b[pos:pos+20]...)
+	pos += 20
+	numChunks := le.Uint32(b[pos:])
+	pos += 4
+
+	const chunkSize = 20 + 4 + 8 + 4 + 4 // 40 bytes
+	for i := range numChunks {
+		if pos+chunkSize > len(b) {
+			return f, 0, fmt.Errorf("steam3 chunk %d/%d truncated", i, numChunks)
+		}
+		var c proto.ContentManifestChunk
+		c.Sha = append([]byte(nil), b[pos:pos+20]...)
+		pos += 20
+		c.Crc = le.Uint32(b[pos:])
+		pos += 4
+		c.Offset = le.Uint64(b[pos:])
+		pos += 8
+		c.CbOriginal = le.Uint32(b[pos:]) // decompressed size
+		pos += 4
+		c.CbCompressed = le.Uint32(b[pos:]) // compressed size
+		pos += 4
+		f.Chunks = append(f.Chunks, c)
+	}
+	return f, pos, nil
+}
+
+// decryptManifestSection decrypts a manifest section using Steam's AES scheme:
+//
+//	wire = encryptedIV(16) + AES-CBC(ciphertext)
+//	where encryptedIV = AES-ECB(key, rawIV)
+//
+// This matches CryptoHelper.SymmetricDecrypt in SteamKit2.
+func decryptManifestSection(data, key []byte) ([]byte, error) {
+	if len(data) < aes.BlockSize {
+		return nil, fmt.Errorf("manifest: section too short to decrypt")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	// ECB-decrypt the first 16 bytes to recover the raw IV.
+	rawIV := make([]byte, aes.BlockSize)
+	block.Decrypt(rawIV, data[:aes.BlockSize])
+
+	ciphertext := data[aes.BlockSize:]
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("manifest: ciphertext not block-aligned")
+	}
+	plaintext := make([]byte, len(ciphertext))
+	cipher.NewCBCDecrypter(block, rawIV).CryptBlocks(plaintext, ciphertext)
+	// Strip PKCS#7 padding.
+	if len(plaintext) == 0 {
+		return nil, fmt.Errorf("manifest: empty plaintext after decrypt")
+	}
+	pad := int(plaintext[len(plaintext)-1])
+	if pad < 1 || pad > aes.BlockSize || pad > len(plaintext) {
+		return plaintext, nil
+	}
+	return plaintext[:len(plaintext)-pad], nil
+}
+
+// lzmaDecompress decompresses LZMA-encoded data.
+func lzmaDecompress(data []byte) ([]byte, error) {
+	r, err := lzma.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r)
+}
+
+// decryptFilename decrypts an AES-CBC encrypted filename.
+// Steam stores encrypted filenames as base64-encoded ciphertext in the proto.
+// The binary format is: encryptedIV(16) + AES-CBC(ciphertext), matching SymmetricDecrypt.
+func decryptFilename(rawname string, depotKey []byte) (string, error) {
+	// Try standard base64 first, then unpadded.
+	enc, err := base64.StdEncoding.DecodeString(rawname)
+	if err != nil {
+		enc, err = base64.RawStdEncoding.DecodeString(rawname)
+		if err != nil {
+			slog.Debug("decryptFilename: base64 failed", "len", len(rawname), "err", err)
+			return "", err
+		}
+	}
+	slog.Debug("decryptFilename: decoded", "b64_len", len(rawname), "bin_len", len(enc))
+	plain, err := decryptManifestSection(enc, depotKey)
+	if err != nil {
+		slog.Debug("decryptFilename: decrypt failed", "err", err)
+		return "", err
+	}
+	result := strings.TrimRight(string(plain), "\x00")
+	slog.Debug("decryptFilename: ok", "result", result)
+	return result, nil
+}
+
+// normalizePath converts Steam's Windows-style backslashes to forward slashes.
+func normalizePath(p string) string {
+	return strings.ReplaceAll(p, "\\", "/")
+}
