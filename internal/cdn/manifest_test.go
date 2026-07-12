@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha1" //nolint:gosec // Steam mandates SHA1
 	"encoding/base64"
+	"encoding/binary"
 	"net/http"
 	"testing"
 
+	"github.com/ulikunitz/xz/lzma"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -207,6 +209,27 @@ func TestDownloadManifest_HTTPError(t *testing.T) {
 func TestLZMADecompressInvalid(t *testing.T) {
 	if _, err := lzmaDecompress([]byte{0x00}); err == nil {
 		t.Error("expected error decoding invalid lzma")
+	}
+}
+
+// Regression test: corrupted/non-LZMA input whose first bytes happen to
+// parse as an LZMA header with a bogus multi-gigabyte dictionary capacity
+// used to make lzma.NewReader allocate that much memory up front and OOM
+// the process. lzmaDecompress must reject it via ValidHeader before ever
+// calling into the lzma package.
+func TestLZMADecompressRejectsBogusDictCap(t *testing.T) {
+	data := make([]byte, lzma.HeaderLen+16)
+	data[0] = 0x5D // valid LZMA properties byte (lc=3, lp=0, pb=2)
+	// Bytes [1:5]: dictCap = 0xe12c0181 (~3.77 GiB), the value observed in
+	// the crash — not a power-of-two-ish size a real encoder would emit.
+	binary.LittleEndian.PutUint32(data[1:5], 0xe12c0181)
+	// Bytes [5:13]: uncompressed size, left as "unknown" (all 0xFF).
+	for i := 5; i < 13; i++ {
+		data[i] = 0xFF
+	}
+
+	if _, err := lzmaDecompress(data); err == nil {
+		t.Error("expected error rejecting bogus dictionary capacity, got nil")
 	}
 }
 

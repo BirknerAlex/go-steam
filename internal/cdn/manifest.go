@@ -428,7 +428,19 @@ func decryptManifestSection(data, key []byte) ([]byte, error) {
 }
 
 // lzmaDecompress decompresses LZMA-encoded data.
+//
+// Callers invoke this speculatively on bytes that aren't guaranteed to
+// actually be LZMA (see decodeManifest and decompressVZip), so the first
+// bytes can be arbitrary data that happens to parse as an LZMA header.
+// That header embeds a dictionary window size which lzma.NewReader
+// allocates up front with no sanity check beyond "< 4 GiB", so garbage
+// input can trigger a multi-gigabyte allocation and OOM the process.
+// ValidHeader rejects any dictCap that isn't a size a real LZMA encoder
+// would produce.
 func lzmaDecompress(data []byte) ([]byte, error) {
+	if len(data) < lzma.HeaderLen || !lzma.ValidHeader(data[:lzma.HeaderLen]) {
+		return nil, fmt.Errorf("lzma: not a valid LZMA header")
+	}
 	r, err := lzma.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
