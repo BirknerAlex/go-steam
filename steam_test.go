@@ -2,6 +2,7 @@ package steam
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/sha1" //nolint:gosec // Steam protocol mandates SHA1
 	"encoding/base64"
@@ -381,6 +382,63 @@ func TestEffectiveOSFilter(t *testing.T) {
 	}
 	if got, want := effectiveOSFilter(AppDownloadRequest{}), steamOSForGOOS(runtime.GOOS); got != want {
 		t.Errorf("empty OS should default to runtime platform: got %q, want %q", got, want)
+	}
+}
+
+// TestValidateOSFilterFor is a regression test for a bug adjacent to the
+// empty-OS-downloads-everything one: on a GOOS Steam doesn't support (e.g.
+// freebsd, plan9), resolveOSFilter("", goos) falls back to "" -- which,
+// unvalidated, previously meant "no OS filtering" and downloaded every
+// platform's depots. validateOSFilterFor must reject that case, and any
+// other case that doesn't resolve to one of Steam's three supported
+// platforms, before a download starts.
+func TestValidateOSFilterFor(t *testing.T) {
+	cases := []struct {
+		name    string
+		reqOS   string
+		goos    string
+		wantErr bool
+	}{
+		{"explicit windows", "windows", "linux", false},
+		{"explicit linux", "linux", "windows", false},
+		{"explicit macos", "macos", "windows", false},
+		{"empty on supported linux host", "", "linux", false},
+		{"empty on supported windows host", "", "windows", false},
+		{"empty on supported darwin host", "", "darwin", false},
+		{"empty on unsupported host", "", "freebsd", true},
+		{"empty on unsupported host plan9", "", "plan9", true},
+		{"explicit garbage value", "amiga", "linux", true},
+		{"explicit case-mismatched value", "Windows", "linux", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateOSFilterFor(tc.reqOS, tc.goos)
+			if tc.wantErr && err == nil {
+				t.Errorf("validateOSFilterFor(%q, %q) = nil, want error", tc.reqOS, tc.goos)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validateOSFilterFor(%q, %q) = %v, want nil", tc.reqOS, tc.goos, err)
+			}
+		})
+	}
+}
+
+// TestDownloadAppRejectsInvalidOSBeforeStarting confirms DownloadApp fails
+// synchronously -- before spawning the download goroutine or touching any
+// session/network state -- when the OS filter is invalid, rather than
+// failing later (or not at all) after already downloading depots.
+func TestDownloadAppRejectsInvalidOSBeforeStarting(t *testing.T) {
+	c := &Client{}
+	ch, err := c.DownloadApp(context.Background(), AppDownloadRequest{
+		AppID:     1,
+		TargetDir: t.TempDir(),
+		OS:        "amiga",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid OS")
+	}
+	if ch != nil {
+		t.Error("expected nil channel on validation failure")
 	}
 }
 

@@ -29,6 +29,9 @@ func (c *Client) DownloadApp(ctx context.Context, req AppDownloadRequest) (<-cha
 	if req.Branch == "" {
 		req.Branch = "public"
 	}
+	if err := validateOSFilter(req); err != nil {
+		return nil, err
+	}
 
 	ch := make(chan Progress, 16)
 	go func() {
@@ -358,11 +361,52 @@ func steamOSForGOOS(goos string) string {
 // binaries under the same paths, corrupting the install -- e.g. Linux and
 // Windows depots both writing files that collide or that the wrong
 // platform's binary tries to load.
+//
+// Callers on the DownloadApp path can assume the result is one of Steam's
+// three supported platforms: DownloadApp calls validateOSFilter up front and
+// fails before starting any depot selection or download if it isn't.
 func effectiveOSFilter(req AppDownloadRequest) string {
-	if req.OS != "" {
-		return req.OS
+	return resolveOSFilter(req.OS, runtime.GOOS)
+}
+
+// validSteamOS lists the platform names Steam's depot ("oslist") and launch
+// ("config.launch") metadata use. There is no fourth option: unlike GOOS,
+// Steam depots only ever target these three.
+var validSteamOS = map[string]bool{"windows": true, "linux": true, "macos": true}
+
+// resolveOSFilter resolves an OS filter: the explicit value if set, otherwise
+// the Steam OS name for goos (see steamOSForGOOS). goos is threaded through
+// as a parameter (rather than reading runtime.GOOS directly) so the resolution
+// and validation logic can be exercised for platforms other than the one
+// running the tests.
+func resolveOSFilter(reqOS, goos string) string {
+	if reqOS != "" {
+		return reqOS
 	}
-	return steamOSForGOOS(runtime.GOOS)
+	return steamOSForGOOS(goos)
+}
+
+// validateOSFilterFor validates the OS filter that would be resolved for
+// (reqOS, goos), without touching runtime.GOOS -- used by validateOSFilter
+// (with goos=runtime.GOOS) and directly by tests for platforms other than
+// whatever GOOS the tests happen to run under.
+func validateOSFilterFor(reqOS, goos string) error {
+	if validSteamOS[resolveOSFilter(reqOS, goos)] {
+		return nil
+	}
+	if reqOS == "" {
+		return fmt.Errorf("steam: cannot auto-detect a Steam-supported OS filter for runtime platform %q; set AppDownloadRequest.OS explicitly to \"windows\", \"linux\", or \"macos\"", goos)
+	}
+	return fmt.Errorf("steam: invalid AppDownloadRequest.OS %q; must be \"windows\", \"linux\", or \"macos\"", reqOS)
+}
+
+// validateOSFilter rejects an AppDownloadRequest whose OS filter -- explicit
+// or auto-detected from runtime.GOOS -- doesn't resolve to one of Steam's
+// three supported platforms. Without this, an empty OS on an unsupported
+// GOOS (e.g. freebsd) would silently fall back to "no OS filtering" and
+// download every platform's depots into the same target dir.
+func validateOSFilter(req AppDownloadRequest) error {
+	return validateOSFilterFor(req.OS, runtime.GOOS)
 }
 
 // restoreLaunchExecutableBits sets the executable bit on the files PICS

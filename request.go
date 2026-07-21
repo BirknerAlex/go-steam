@@ -19,6 +19,11 @@ type AppDownloadRequest struct {
 	// empty to auto-detect the OS this process is running on (via
 	// runtime.GOOS). Depots without OS metadata (shared/common depots) are
 	// always included regardless of this filter.
+	//
+	// DownloadApp rejects the request before downloading anything if OS is
+	// set to a value other than the three above, or if it's empty and
+	// runtime.GOOS isn't one Steam supports (e.g. freebsd) -- there is no
+	// "download every platform" fallback.
 	OS string
 
 	// Language filters language depots. Leave empty for no language filtering.
