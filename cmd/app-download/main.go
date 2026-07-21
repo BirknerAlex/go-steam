@@ -20,7 +20,7 @@ func main() {
 		depotIDs     = flag.String("depots", "", "Comma-separated depot IDs to download (empty = all)")
 		branch       = flag.String("branch", "public", "Branch name (e.g. 'public', 'beta')")
 		branchPass   = flag.String("branch-password", "", "Password for protected branches")
-		os_          = flag.String("os", "linux", "OS filter: linux, windows, macos, or empty for all")
+		os_          = flag.String("os", "", "OS filter: linux, windows, macos, or empty to auto-detect the current platform")
 		lang         = flag.String("lang", "", "Language filter (e.g. 'english'), or empty for all")
 		username     = flag.String("username", "", "Steam account username (leave empty for anonymous)")
 		password     = flag.String("password", "", "Steam account password")

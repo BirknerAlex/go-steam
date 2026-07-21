@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"github.com/BirknerAlex/go-steam/internal/cdn"
 	"github.com/BirknerAlex/go-steam/internal/cm"
@@ -307,6 +308,17 @@ func (c *Client) downloadApp(ctx context.Context, req AppDownloadRequest, ch cha
 // ---- helpers ----------------------------------------------------------------
 
 func selectDepots(appInfo *cm.AppInfo, req AppDownloadRequest, hasAuth bool) []*cm.DepotInfo {
+	osFilter := req.OS
+	if osFilter == "" {
+		// Default to the platform this process is running on rather than
+		// downloading depots for every OS: many apps (e.g. Unreal Engine
+		// games) ship platform-specific binaries under the same paths, and
+		// mixing them corrupts the install (e.g. Linux + Windows depots
+		// both writing files that collide or that the wrong platform's
+		// binary tries to load).
+		osFilter = steamOSForGOOS(runtime.GOOS)
+	}
+
 	var result []*cm.DepotInfo
 	for _, d := range appInfo.Depots {
 		if len(req.DepotIDs) > 0 && !containsUint32(req.DepotIDs, d.DepotID) {
@@ -315,12 +327,28 @@ func selectDepots(appInfo *cm.AppInfo, req AppDownloadRequest, hasAuth bool) []*
 		if !hasAuth && !d.AllowAnonymous {
 			continue
 		}
-		if req.OS != "" && d.OSList != "" && !strings.Contains(d.OSList, req.OS) {
+		if osFilter != "" && d.OSList != "" && !strings.Contains(d.OSList, osFilter) {
 			continue
 		}
 		result = append(result, d)
 	}
 	return result
+}
+
+// steamOSForGOOS maps a Go runtime.GOOS value to the OS name Steam uses in
+// depot "oslist" metadata ("windows", "macos", "linux"). Unknown values
+// return "" so callers fall back to no OS filtering.
+func steamOSForGOOS(goos string) string {
+	switch goos {
+	case "windows":
+		return "windows"
+	case "darwin":
+		return "macos"
+	case "linux":
+		return "linux"
+	default:
+		return ""
+	}
 }
 
 // resolveManifestGID determines the manifest GID for a depot on the requested

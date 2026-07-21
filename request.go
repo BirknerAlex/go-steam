@@ -15,7 +15,10 @@ type AppDownloadRequest struct {
 	// BranchPassword is required for password-protected beta branches.
 	BranchPassword string
 
-	// OS filters depots by target OS: "windows", "linux", "macos", or "" for all.
+	// OS filters depots by target OS: "windows", "linux", or "macos". Leave
+	// empty to auto-detect the OS this process is running on (via
+	// runtime.GOOS). Depots without OS metadata (shared/common depots) are
+	// always included regardless of this filter.
 	OS string
 
 	// Language filters language depots. Leave empty for no language filtering.

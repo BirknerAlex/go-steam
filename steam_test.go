@@ -175,10 +175,63 @@ func TestSelectDepots(t *testing.T) {
 		t.Errorf("DepotIDs restriction failed: %v", depotIDset(got))
 	}
 
-	// Empty OS = no OS filtering.
-	got = selectDepots(appInfo, AppDownloadRequest{}, true)
-	if len(got) != 4 {
-		t.Errorf("no filter should select all 4 depots, got %d", len(got))
+	// Explicit OS filter for a platform with no matching depot: only the
+	// OS-agnostic depot survives.
+	got = selectDepots(appInfo, AppDownloadRequest{OS: "macos"}, true)
+	if len(got) != 1 || got[0].DepotID != 13 {
+		t.Errorf("macos filter should select only depot 13, got %v", depotIDset(got))
+	}
+}
+
+// TestSelectDepotsDefaultsToRuntimeOS is a regression test for a bug where an
+// empty OS filter downloaded depots for every platform into the same target
+// dir (e.g. Windows .dll and Linux .so files mixed together), which corrupts
+// mixed-platform installs. An empty req.OS must now default to the platform
+// the process is running on rather than disabling OS filtering entirely.
+func TestSelectDepotsDefaultsToRuntimeOS(t *testing.T) {
+	appInfo := &cm.AppInfo{
+		Depots: map[uint32]*cm.DepotInfo{
+			10: {DepotID: 10, AllowAnonymous: true, OSList: "linux"},
+			11: {DepotID: 11, AllowAnonymous: true, OSList: "windows"},
+			14: {DepotID: 14, AllowAnonymous: true, OSList: "macos"},
+			13: {DepotID: 13, AllowAnonymous: true, OSList: ""}, // OS-agnostic
+		},
+	}
+
+	got := selectDepots(appInfo, AppDownloadRequest{}, true)
+	ids := depotIDset(got)
+
+	// The OS-agnostic depot is always selected.
+	if !ids[13] {
+		t.Error("expected OS-agnostic depot 13 to always be selected")
+	}
+
+	// Exactly the depot matching the current runtime platform (if any)
+	// should additionally be selected -- never depots for other platforms.
+	want := steamOSForGOOS(runtime.GOOS)
+	platformDepots := map[uint32]string{10: "linux", 11: "windows", 14: "macos"}
+	for id, os := range platformDepots {
+		if os == want {
+			if !ids[id] {
+				t.Errorf("expected depot %d (%s) to be selected for runtime OS %q", id, os, runtime.GOOS)
+			}
+		} else if ids[id] {
+			t.Errorf("depot %d (%s) should not be selected for runtime OS %q -- got all depots, defaulting is not filtering", id, os, runtime.GOOS)
+		}
+	}
+}
+
+func TestSteamOSForGOOS(t *testing.T) {
+	cases := map[string]string{
+		"windows": "windows",
+		"darwin":  "macos",
+		"linux":   "linux",
+		"freebsd": "", // unknown platform: no filtering
+	}
+	for goos, want := range cases {
+		if got := steamOSForGOOS(goos); got != want {
+			t.Errorf("steamOSForGOOS(%q) = %q, want %q", goos, got, want)
+		}
 	}
 }
 
