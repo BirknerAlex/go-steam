@@ -301,6 +301,15 @@ func (c *Client) downloadApp(ctx context.Context, req AppDownloadRequest, ch cha
 		}
 	}
 
+	// Restore the executable bit on the platform's launch script/binary.
+	// Depot manifests frequently don't set the per-file Executable flag on the
+	// actual game/server binary (observed even on the primary launch script),
+	// so fall back to PICS "config.launch", which reliably names the file
+	// Steam itself would run for this platform.
+	if !req.ValidateOnly {
+		restoreLaunchExecutableBits(req.TargetDir, appInfo.LaunchEntries, effectiveOSFilter(req))
+	}
+
 	send(Progress{Phase: PhaseComplete})
 	return nil
 }
@@ -308,16 +317,7 @@ func (c *Client) downloadApp(ctx context.Context, req AppDownloadRequest, ch cha
 // ---- helpers ----------------------------------------------------------------
 
 func selectDepots(appInfo *cm.AppInfo, req AppDownloadRequest, hasAuth bool) []*cm.DepotInfo {
-	osFilter := req.OS
-	if osFilter == "" {
-		// Default to the platform this process is running on rather than
-		// downloading depots for every OS: many apps (e.g. Unreal Engine
-		// games) ship platform-specific binaries under the same paths, and
-		// mixing them corrupts the install (e.g. Linux + Windows depots
-		// both writing files that collide or that the wrong platform's
-		// binary tries to load).
-		osFilter = steamOSForGOOS(runtime.GOOS)
-	}
+	osFilter := effectiveOSFilter(req)
 
 	var result []*cm.DepotInfo
 	for _, d := range appInfo.Depots {
@@ -348,6 +348,44 @@ func steamOSForGOOS(goos string) string {
 		return "linux"
 	default:
 		return ""
+	}
+}
+
+// effectiveOSFilter resolves req.OS to the Steam OS name actually used for
+// depot and launch-entry matching: the explicit value if set, otherwise the
+// platform this process is running on (see steamOSForGOOS). Downloading
+// depots for every OS at once (the old default) mixes platform-specific
+// binaries under the same paths, corrupting the install -- e.g. Linux and
+// Windows depots both writing files that collide or that the wrong
+// platform's binary tries to load.
+func effectiveOSFilter(req AppDownloadRequest) string {
+	if req.OS != "" {
+		return req.OS
+	}
+	return steamOSForGOOS(runtime.GOOS)
+}
+
+// restoreLaunchExecutableBits sets the executable bit on the files PICS
+// "config.launch" names as this platform's launch executable(s). Depot
+// manifests frequently omit the per-file Executable flag on the actual
+// game/server binary or launch script, so this is a more reliable source of
+// which file needs +x. Missing files (e.g. a launch entry for a platform
+// that wasn't downloaded) are silently skipped. No-op for Windows, which has
+// no concept of a unix executable bit.
+func restoreLaunchExecutableBits(targetDir string, entries []cm.LaunchEntry, osFilter string) {
+	if osFilter == "windows" || runtime.GOOS == "windows" {
+		return
+	}
+	for _, le := range entries {
+		if le.OSList != "" && osFilter != "" && !strings.Contains(le.OSList, osFilter) {
+			continue
+		}
+		absPath := filepath.Join(targetDir, filepath.FromSlash(le.Executable))
+		info, err := os.Stat(absPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		_ = os.Chmod(absPath, info.Mode()|0o111)
 	}
 }
 

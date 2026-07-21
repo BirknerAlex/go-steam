@@ -176,6 +176,62 @@ func TestParseAppInfo_Full(t *testing.T) {
 	}
 }
 
+// TestParseAppInfo_LaunchEntries mirrors the real PICS "config.launch"
+// shape for a Palworld-like dedicated server app: a Windows entry, a Linux
+// entry (the one that matters -- its executable is a shell script that
+// needs the executable bit set after download), and an unrestricted entry
+// with no "config.oslist" at all.
+func TestParseAppInfo_LaunchEntries(t *testing.T) {
+	vdf := `"appinfo"
+{
+	"appid"  "2394010"
+	"config"
+	{
+		"installdir"  "PalServer"
+		"launch"
+		{
+			"0"
+			{
+				"executable"  "PalServer.exe"
+				"config"
+				{
+					"oslist"  "windows"
+				}
+			}
+			"1"
+			{
+				"executable"  "PalServer.sh"
+				"config"
+				{
+					"oslist"  "linux"
+				}
+			}
+			"2"
+			{
+				"executable"  "PalServer.exe"
+			}
+		}
+	}
+}`
+	info, err := parseAppInfo(slog.Default(), proto.PICSAppResult{Appid: 2394010, Buffer: []byte(vdf)})
+	if err != nil {
+		t.Fatalf("parseAppInfo: %v", err)
+	}
+	if len(info.LaunchEntries) != 3 {
+		t.Fatalf("LaunchEntries count = %d, want 3: %+v", len(info.LaunchEntries), info.LaunchEntries)
+	}
+	// Sorted by numeric index: windows, linux, unrestricted.
+	if got := info.LaunchEntries[0]; got.Executable != "PalServer.exe" || got.OSList != "windows" {
+		t.Errorf("entry 0 = %+v, want {PalServer.exe windows}", got)
+	}
+	if got := info.LaunchEntries[1]; got.Executable != "PalServer.sh" || got.OSList != "linux" {
+		t.Errorf("entry 1 = %+v, want {PalServer.sh linux}", got)
+	}
+	if got := info.LaunchEntries[2]; got.Executable != "PalServer.exe" || got.OSList != "" {
+		t.Errorf("entry 2 = %+v, want {PalServer.exe \"\"}", got)
+	}
+}
+
 func TestParseAppInfo_EmptyBuffer(t *testing.T) {
 	info, err := parseAppInfo(slog.Default(), proto.PICSAppResult{Appid: 5})
 	if err != nil {

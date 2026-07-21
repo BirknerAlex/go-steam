@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,12 +29,28 @@ type DepotInfo struct {
 	EncryptedManifestGIDs map[string]string
 }
 
+// LaunchEntry describes one entry from PICS "config.launch" -- the
+// executable Steam itself would run for a given platform. Depot manifests
+// frequently omit the per-file Executable flag (EDepotFileFlag 0x20) even on
+// the actual server/game binary, so this is the more reliable source for
+// which file needs the executable bit set after download.
+type LaunchEntry struct {
+	// Executable is the path (relative to the install dir) of the binary or
+	// script Steam launches, e.g. "PalServer.sh".
+	Executable string
+	// OSList is the comma-separated target OS list from this launch entry's
+	// own "config.oslist" (e.g. "linux"). Empty means unrestricted.
+	OSList string
+}
+
 // AppInfo holds the PICS product info for a Steam app.
 type AppInfo struct {
 	AppID         uint32
 	Type          string // "game", "tool", "server", etc.
 	Depots        map[uint32]*DepotInfo
 	WorkshopDepot uint32 // depot used for workshop content; 0 if not set
+	// LaunchEntries lists the app's PICS "config.launch" entries, if any.
+	LaunchEntries []LaunchEntry
 	fetched       time.Time
 }
 
@@ -188,6 +205,10 @@ func parseAppInfo(log *slog.Logger, r proto.PICSAppResult) (*AppInfo, error) {
 		return info, nil
 	}
 
+	if config, ok := appKV["config"].(map[string]any); ok {
+		info.LaunchEntries = parseLaunchSection(config["launch"])
+	}
+
 	if common, ok := appKV["common"]; ok {
 		if obj, ok := common.(map[string]any); ok {
 			if t, ok := obj["type"].(string); ok {
@@ -244,6 +265,46 @@ func kvKeys(m map[string]any) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// parseLaunchSection parses "config.launch" -- a map of numeric index →
+// launch entry (executable, arguments, per-entry "config.oslist", ...).
+// Entries are returned sorted by index for deterministic output.
+func parseLaunchSection(section any) []LaunchEntry {
+	lobj, ok := section.(map[string]any)
+	if !ok {
+		return nil
+	}
+	indices := make([]string, 0, len(lobj))
+	for idx := range lobj {
+		indices = append(indices, idx)
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		ni, erri := strconv.Atoi(indices[i])
+		nj, errj := strconv.Atoi(indices[j])
+		if erri == nil && errj == nil {
+			return ni < nj
+		}
+		return indices[i] < indices[j]
+	})
+
+	var entries []LaunchEntry
+	for _, idx := range indices {
+		entry, ok := lobj[idx].(map[string]any)
+		if !ok {
+			continue
+		}
+		exe, _ := entry["executable"].(string)
+		if exe == "" {
+			continue
+		}
+		var osList string
+		if cfg, ok := entry["config"].(map[string]any); ok {
+			osList, _ = cfg["oslist"].(string)
+		}
+		entries = append(entries, LaunchEntry{Executable: exe, OSList: osList})
+	}
+	return entries
 }
 
 // parseManifestSection fills gids from a "manifests" or "encryptedmanifests" value.

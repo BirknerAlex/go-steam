@@ -316,6 +316,74 @@ func TestPreallocateExecutableBit(t *testing.T) {
 	}
 }
 
+// TestRestoreLaunchExecutableBits is a regression test for the Palworld
+// dedicated server, whose depot manifest sets EDepotFileFlag.Executable on
+// none of its files -- not even PalServer.sh, the file Steam itself would
+// run. PICS "config.launch" is the reliable fallback: it names PalServer.sh
+// as the Linux launch executable, so it must end up +x after download even
+// though the manifest gave no per-file hint.
+func TestRestoreLaunchExecutableBits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix exec bit semantics don't apply on windows")
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"PalServer.sh", "PalServer.exe", "Readme.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := []cm.LaunchEntry{
+		{Executable: "PalServer.exe", OSList: "windows"},
+		{Executable: "PalServer.sh", OSList: "linux"},
+		{Executable: "Missing.sh", OSList: "linux"}, // not downloaded; must not error
+	}
+
+	restoreLaunchExecutableBits(dir, entries, "linux")
+
+	sh, err := os.Stat(filepath.Join(dir, "PalServer.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh.Mode().Perm()&0o111 == 0 {
+		t.Errorf("PalServer.sh should be executable after linux download, got %v", sh.Mode().Perm())
+	}
+
+	exe, err := os.Stat(filepath.Join(dir, "PalServer.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe.Mode().Perm()&0o111 != 0 {
+		t.Errorf("PalServer.exe (windows-only entry) should not be touched for a linux download, got %v", exe.Mode().Perm())
+	}
+}
+
+func TestRestoreLaunchExecutableBits_WindowsFilterIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "PalServer.exe"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries := []cm.LaunchEntry{{Executable: "PalServer.exe", OSList: "windows"}}
+
+	restoreLaunchExecutableBits(dir, entries, "windows")
+
+	st, err := os.Stat(filepath.Join(dir, "PalServer.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o644 {
+		t.Errorf("windows target should not gain exec bits, got %v", st.Mode().Perm())
+	}
+}
+
+func TestEffectiveOSFilter(t *testing.T) {
+	if got := effectiveOSFilter(AppDownloadRequest{OS: "macos"}); got != "macos" {
+		t.Errorf("explicit OS should win: got %q", got)
+	}
+	if got, want := effectiveOSFilter(AppDownloadRequest{}), steamOSForGOOS(runtime.GOOS); got != want {
+		t.Errorf("empty OS should default to runtime platform: got %q, want %q", got, want)
+	}
+}
+
 func TestChunkOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	rel := "data.bin"
