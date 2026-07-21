@@ -6,6 +6,8 @@ A Go library for downloading Steam app content and Workshop items without the St
 
 - Anonymous downloads for publicly accessible apps (no account required)
 - Authenticated downloads for paid games and Workshop items
+- OS filtering auto-detects the current platform by default, so a single call never mixes Windows/Linux/macOS depots in the same target dir
+- Restores the executable bit on the platform's launch script/binary via PICS launch metadata when the depot manifest doesn't set it
 - Incremental updates — only downloads chunks that differ from what is already on disk
 - Concurrent chunk downloads with configurable parallelism
 - Supports VZip-ZSTD, VZip-LZMA, ZIP, and ZLib chunk formats
@@ -85,7 +87,7 @@ go run ./cmd/app-download \
 | `-depots` | all | Comma-separated depot IDs to restrict download |
 | `-branch` | `public` | Branch name |
 | `-branch-password` | — | Password for protected beta branches |
-| `-os` | `linux` | OS filter: `linux`, `windows`, `macos`, or empty for all |
+| `-os` | empty (auto-detect) | OS filter: `linux`, `windows`, or `macos`; empty auto-detects the current platform. Downloads fail up front if this doesn't resolve to one of the three |
 | `-lang` | all | Language filter (e.g. `english`) |
 | `-username` | — | Steam account username (omit for anonymous) |
 | `-password` | — | Steam account password |

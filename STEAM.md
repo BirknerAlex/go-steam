@@ -217,6 +217,7 @@ type AppInfo struct {
     Type          string            // "game", "tool", "server", etc.
     Depots        map[uint32]*DepotInfo
     WorkshopDepot uint32            // depot that holds workshop items
+    LaunchEntries []LaunchEntry     // parsed from PICS "config.launch"
 }
 
 type DepotInfo struct {
@@ -226,11 +227,25 @@ type DepotInfo struct {
     ManifestGIDs           map[string]uint64 // branch → manifest GID (plaintext branches)
     EncryptedManifestGIDs  map[string]string // branch → hex-encoded encrypted GID blob (password-protected branches)
 }
+
+// LaunchEntry is one PICS "config.launch" entry -- the executable Steam
+// itself would run for a given platform. Depot manifests frequently omit
+// the per-file Executable flag even on the actual launch binary/script, so
+// this is the more reliable source of which file needs +x after download.
+type LaunchEntry struct {
+    Executable string // path relative to the install dir, e.g. "PalServer.sh"
+    OSList     string // this entry's own "config.oslist"; "" = unrestricted
+}
 ```
 
 Results are cached in-process for 5 minutes (TTL per `AppInfoCache`).
 
 ### Depot selection (app download)
+
+`DownloadApp` validates the OS filter before any of this runs (`validateOSFilter`):
+`req.OS` if set, otherwise `steamOSForGOOS(runtime.GOOS)`, must resolve to one of
+`"windows"`, `"linux"`, `"macos"` — an empty `OS` on an unsupported `GOOS` (e.g.
+`freebsd`) is a hard error, not a fallback to "no filtering".
 
 ```mermaid
 flowchart TD
@@ -241,12 +256,10 @@ flowchart TD
     D --> E
     E -->|No auth| F[Drop non-anonymous depots]
     E -->|Has auth| G[Keep all]
-    F --> H{OS filter set?}
+    F --> H[osFilter = req.OS, else steamOSForGOOS(GOOS)]
     G --> H
-    H -->|Yes| I[Drop depots not matching OS]
-    H -->|No| J[Keep all]
+    H --> I[Drop depots whose OSList doesn't contain osFilter\nOS-agnostic depots always kept]
     I --> K[Selected depots]
-    J --> K
 ```
 
 ---
@@ -311,6 +324,11 @@ The `requestCode` is obtained from the CM via `ContentServerDirectory.GetManifes
 | `fileExecutable` | `0x20` | `chmod +x` on extract |
 | `fileDir` | `0x40` | Entry is a directory |
 | (symlink) | detected by `SymlinkTarget != ""` | Symlink |
+
+`fileExecutable` is unreliable in practice: some depots (observed on the Palworld
+dedicated server depot) report `flags=0`, on every file, including the actual
+launch binary/script. `DownloadApp` falls back to PICS `config.launch` for this
+case — see [`restoreLaunchExecutableBits`](#app-download-pipeline).
 
 ### ChunkInfo
 
@@ -443,8 +461,9 @@ sequenceDiagram
     participant CDN
 
     Caller->>Client: DownloadApp(AppDownloadRequest)
+    Client->>Client: validateOSFilter(req)\n(reject before any work if OS doesn't\nresolve to windows/linux/macos)
     Client->>CM: GetAppInfo(appID)
-    CM-->>Client: AppInfo{Depots}
+    CM-->>Client: AppInfo{Depots, LaunchEntries}
     Client->>Client: selectDepots(OS, auth, depotIDs filter)
 
     opt password-protected branch (BranchPassword set)
@@ -469,6 +488,7 @@ sequenceDiagram
         Client-->>Caller: Progress{DoneChunks, DoneBytes}
     end
 
+    Client->>Client: restoreLaunchExecutableBits(LaunchEntries, OS)\n(chmod +x the platform's launch file if present;\nfallback for unreliable fileExecutable flag)
     Client-->>Caller: Progress{Phase: Complete}
 ```
 
@@ -480,7 +500,7 @@ type AppDownloadRequest struct {
     DepotIDs       []uint32  // empty = all eligible depots
     Branch         string    // default "public"
     BranchPassword string
-    OS             string    // "linux", "windows", "macos", or ""
+    OS             string    // "linux", "windows", "macos", or "" (auto-detect via runtime.GOOS)
     Language       string    // e.g. "english"; "" = all
     TargetDir      string    // required
     ValidateOnly   bool      // verify on-disk SHA-1 without writing
@@ -535,7 +555,7 @@ graph TD
     Collector -->|cancelDL on error| Spawner
 ```
 
-`MaxParallelChunks` (default: 8) controls the semaphore. The spawner and collector run concurrently so progress events fire as chunks complete, not only when all workers finish a batch.
+`MaxParallelChunks` (default: 16) controls the semaphore. The spawner and collector run concurrently so progress events fire as chunks complete, not only when all workers finish a batch.
 
 ### Error handling
 
@@ -643,7 +663,7 @@ type Config struct {
     SteamGuardCallback func(guardType, emailHint string) (string, error)
     CachePath          string          // default: ~/.cache/go-steam
     CellID             uint32          // CDN cell for geo-routing (default 0)
-    MaxParallelChunks  uint            // default 8
+    MaxParallelChunks  uint            // default 16
     MaxParallelManifests uint          // default 4
     CMServers          []string        // override CM server list
     Log                *slog.Logger
@@ -672,13 +692,15 @@ type Progress struct {
     Err         error  // non-nil signals terminal failure
 }
 
-type Phase string
+// Phase is an int enum, not a string; String() gives the names below
+// (e.g. for %s formatting or log fields).
+type Phase int
 const (
-    PhaseResolving   Phase = "resolving"
-    PhaseManifest    Phase = "manifest"
-    PhaseDiffing     Phase = "diffing"
-    PhaseDownloading Phase = "downloading"
-    PhaseComplete    Phase = "complete"
+    PhaseResolving   Phase = iota // String(): "resolving"
+    PhaseManifest                 // "manifest"
+    PhaseDiffing                  // "diffing"
+    PhaseDownloading              // "downloading"
+    PhaseComplete                 // "complete"
 )
 ```
 
